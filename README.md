@@ -1,202 +1,162 @@
-# Polymarket Watcher
+# Polymarket Whale Tracker — Data Pipeline
 
-A Telegram bot that polls the Polymarket data API for a watchlist of wallet
-addresses and pushes an alert whenever one of them makes a trade above a
-notional threshold.
+An analytics layer over an existing Telegram alerting bot. The bot polls the
+Polymarket trades API every 30 seconds for ~19 tracked wallets and alerts on
+trades above a $1,000 notional threshold. It never kept any of it.
 
----
-
-## What it does
-
-Every `POLL_INTERVAL` seconds the bot fetches the most recent 150 trades for
-each tracked address, filters out anything it has already seen, groups the
-remaining fills into logical orders, and sends a Telegram message for each
-order worth at least `MIN_TRADE_NOTIONAL` USDC.
-
-An alert looks like this:
+This adds persistence and query: every trade the API returns lands in S3,
+gets cleaned into Parquet, and becomes queryable in Athena.
 
 ```
-📈 New trade by Pringles (0xb1d9476e5a5ba938b57cf0a5dc7a91a114605ee1)
-BUY 12,400 @ 0.4150 (~$5,146) (3 fills)
-Market: Will X happen by December? (Yes)
-Time: 2026-08-21 14:02:11 UTC
-Link: https://polymarket.com/event/will-x-happen-by-december
-Tx: https://polygonscan.com/tx/0xabc...
+Polymarket API
+      │  poll every 30s (existing bot)
+      ▼
+  ┌────────────────┬─────────────────┐
+  │  Telegram      │  S3 raw         │   alerting is unchanged;
+  │  alert         │  (NDJSON.gz)    │   persistence is a second path
+  └────────────────┴─────────────────┘
+                          │  dt=YYYY-MM-DD, event time
+                          ▼
+                   transform (daily)
+                   dedupe · clean · Parquet
+                          │  staging → verify → swap
+                          ▼
+                   S3 curated
+                          │
+                   Glue Catalog
+                          │
+                 ┌────────┴────────┐
+                 ▼                 ▼
+             Athena          gold aggregates
+             (ad-hoc)        (CTAS, daily)
 ```
 
----
+## Why the layers
 
-## Requirements
+**Raw** is append-only and unfiltered. The alert path drops sub-threshold
+trades and deduplicates; raw deliberately does neither. If the threshold
+changes, or a dedupe bug turns up, the history is intact and everything can be
+rebuilt. Filtering at ingest destroys data you can't get back.
 
-- Python 3.10+ (the code uses `X | None` type syntax)
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Your Telegram numeric chat ID(s) — get one from [@userinfobot](https://t.me/userinfobot)
+**Curated** is the clean, deduplicated, typed version analysts query. It is
+always derivable from raw, which is what makes it safe to rebuild.
+
+**Gold** is materialized aggregates — daily per-wallet rollups via Athena
+CTAS. Not Spark: at this volume SQL is the right tool and adding Spark would
+be architecture cosplay.
+
+## Design decisions
+
+**Partition by event time, not processing time.** The partition key comes from
+the trade's own timestamp. A trade the API surfaces late lands in the day it
+actually happened, so rebuilding that day picks it up correctly. Partitioning
+by ingest time would scatter one day's trades across whichever days we
+happened to see them.
+
+**Idempotent whole-partition overwrite.** The transform never appends. It
+rebuilds a date partition from scratch: read all raw for that date, dedupe,
+write one Parquet file. Running it once or five times produces byte-identical
+output — there's a test asserting exactly that. This is what makes retry-after-
+failure safe and backfill a JSON payload rather than a manual operation.
+
+**Staging, verify, swap.** S3 has no atomic directory rename. So: write to
+`_staging/`, read it back and check the row count, copy into the live prefix,
+then delete the old objects. A reader sees the old partition or the new one,
+never a half-deleted one. A corrupt write fails at the verify step without
+taking out a good partition.
+
+**Dedupe on a composite key.** `transactionHash` is not unique — one order
+matched against several makers returns multiple rows sharing a hash. The key
+is hash + timestamp + side + asset + outcome + size + price, mirroring the
+bot's own `trade_key()`. Keying on the hash alone would silently swallow every
+fill after the first, which is a bug the bot itself had at one point.
+
+**Buffered writes.** At a 30-second poll, one object per trade would mean tens
+of thousands of tiny files a day. Small files are the classic S3/Athena cost
+sink — every object costs a request and a seek. The sink buffers and flushes on
+size (500 records) or age (5 minutes); the transform compacts further into one
+Parquet file per day.
+
+**Schema tolerance.** The transform selects named fields. Anything new
+upstream is preserved as JSON in a `raw_extra` column rather than dropped or
+allowed to break the job. A new field is visible in the warehouse the day it
+appears, and promoting it to a real column later is a DDL change plus a
+backfill — both of which this pipeline supports.
+
+**Split IAM identities.** The bot can `PutObject` to the raw prefix and
+nothing else — no read, no delete, no access to curated. If the bot host is
+compromised, an attacker can append junk to raw; they cannot read history or
+destroy it. The transform can read raw and rebuild curated but can never write
+to raw. That asymmetry is what makes raw a trustworthy rebuild source.
+
+## Failure modes and how they're handled
+
+| Failure | Handling |
+|---|---|
+| S3 unreachable during a poll | Buffer spills to local disk, uploaded on next startup |
+| Transform dies halfway | Nothing was swapped; rerun rebuilds the partition |
+| Corrupt Parquet written | Verify step catches it before the live swap |
+| Trade arrives days late | Lands in its event-time partition; rerun that date |
+| Upstream adds a field | Captured in `raw_extra`; job doesn't break |
+| Duplicate trades in raw | Expected — the 150-trade window re-returns them; transform dedupes |
+| Bad JSON line in a raw object | Skipped and logged; the partition still processes |
+
+## Layout
+
+```
+pipeline/
+├── sink.py                  buffered S3 raw writer, imported by bot.py
+├── transform.py             raw → curated, idempotent, CLI + backfill
+├── lambda_handler.py        Lambda entry point for the daily run
+├── bot_changes.md           the four edits to bot.py
+├── athena/
+│   ├── ddl.sql              external tables, partition projection, gold CTAS
+│   └── queries.sql          analytical queries + a data quality check
+├── infra/
+│   └── setup.md             bucket, KMS, lifecycle, IAM, scheduling, cost
+└── tests/
+    └── test_pipeline.py     dedupe, idempotency, schema drift, late arrival
+```
+
+## Running it
+
+Locally, no AWS needed:
 
 ```bash
-pip install "python-telegram-bot[job-queue]>=20.0" httpx
+python tests/test_pipeline.py
+python transform.py --date 2026-09-09 --local ./sample_data
 ```
 
-The `[job-queue]` extra matters. Without it `app.job_queue` is `None` and the
-bot starts but never polls.
-
----
-
-## Setup
-
-**1. Set your token as an environment variable.**
+Against S3:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123456789:AAH..."
+export S3_RAW_BUCKET=your-bucket
+export AWS_REGION=us-east-1
+
+python transform.py --date 2026-09-09
+python transform.py --backfill 2026-09-01 2026-09-09
 ```
 
-The bot refuses to start without it. Never put the token back in the source
-file — a token in a file you share, paste, or commit is a token someone else
-can drive your bot with.
+## What's deliberately not here
 
-**2. Set your chat IDs.**
+**Streaming.** Nineteen wallets on a 30-second poll is not a streaming
+problem. Kafka or Kinesis here would be infrastructure without a reason.
 
-Edit `TELEGRAM_CHAT_IDS` near the top of `polymarket_bot.py`. These are the
-chats that receive alerts. The bot must have been started (`/start`) by each
-user, or added to each group, before it can message them.
+**Spark.** A day's data is megabytes. Glue Spark would cost more in startup
+time than the job takes to run. If volume grew 1000x, the transform's shape —
+read a partition, dedupe, write a partition — ports to Spark almost directly.
 
-**3. Run it.**
+**Airflow.** One daily job with no dependencies. EventBridge is enough.
+Airflow earns its keep when there are dependencies between stages and backfill
+across a DAG; there aren't yet.
 
-```bash
-python polymarket_bot.py
-```
+Each of these is a step the pipeline could take when there's a reason. Taking
+them now would mean carrying operational cost for capability nobody needs.
 
-On first run it creates `tracked_addresses.json` seeded from
-`DEFAULT_TRACKED_ADDRESSES`, and baselines every address so you don't get a
-flood of historical trades.
+## Next
 
----
-
-## Bot commands
-
-| Command | Description |
-| --- | --- |
-| `/start` | Confirm the bot is alive and list commands |
-| `/list` | Show every tracked address and its label |
-| `/add 0xAddress Label` | Start tracking an address. Label may contain spaces. |
-| `/remove 0xAddress` | Stop tracking and drop its state |
-| `/status` | Last poll age, duration, fetch errors, alerts sent |
-
-Newly added addresses are baselined at the moment you add them, so you only
-see trades made from that point forward.
-
-`/status` is the first place to look when alerts stop arriving. If it reports
-a poll duration close to `POLL_INTERVAL`, or a nonzero error count, that's your
-problem.
-
----
-
-## Configuration
-
-All of this lives at the top of `polymarket_bot.py`.
-
-| Setting | Default | Notes |
-| --- | --- | --- |
-| `POLL_INTERVAL` | `30` | Seconds between polls. Watch for the overrun warning in the logs if you lower it. |
-| `MIN_TRADE_NOTIONAL` | `1000` | Minimum order value in USDC to alert on. |
-| `MAX_SEEN_KEYS` | `2000` | Trade keys remembered per address. Must stay comfortably above the 150-trade fetch window. |
-| `HTTP_CONCURRENCY` | `5` | Simultaneous requests to the Polymarket API. |
-| `FETCH_RETRIES` | `2` | Retries on timeouts, 429s, and 5xx. |
-| `AGGREGATE_FILLS_BY_TX` | `True` | Group fills into one alert and threshold on the combined size. |
-
-### On `AGGREGATE_FILLS_BY_TX`
-
-A single Polymarket order matched against several makers comes back from the
-API as several rows sharing one transaction hash. With aggregation on, those
-collapse into one alert and the threshold is applied to the total — so a
-$5,000 order that filled as ten $500 chunks correctly fires. With it off, each
-fill is evaluated on its own and that order produces no alert at all.
-
-Leave it on unless you specifically want fill-level granularity.
-
----
-
-## Data files
-
-Both are plain JSON in the working directory, written atomically (temp file +
-`os.replace`) so a crash mid-write can't leave a truncated file.
-
-**`tracked_addresses.json`** — `{address: label}`. Safe to hand-edit while the
-bot is stopped. Addresses are lowercased on load, so casing doesn't matter.
-
-**`polymarket_state.json`** — per-address dedup state:
-
-```json
-{
-  "0xabc...": {
-    "last_ts": 1755782400,
-    "seen_hashes": ["0xdef...|1755782390|BUY|...", "..."],
-    "key_version": 2
-  }
-}
-```
-
-- `last_ts` — newest trade timestamp seen, used for cold-start baselining
-- `seen_hashes` — composite trade keys, newest last, trimmed to `MAX_SEEN_KEYS`
-- `key_version` — bumped when the key format changes; triggers a re-baseline
-
-Deleting this file makes the bot re-baseline everything on the next run: no
-alerts for existing history, no duplicates.
-
----
-
-## How deduplication works
-
-Identity is a composite key, not the bare transaction hash:
-
-```
-transactionHash | timestamp | side | asset | outcome | size | price
-```
-
-The transaction hash alone is not unique per fill, so keying on it silently
-discards every fill after the first in a multi-maker order.
-
-Keys are stored in an **ordered list** with a set alongside for lookups. Order
-matters: trimming an unordered set keeps an arbitrary subset rather than the
-newest entries, and a key evicted while still inside the API's 150-trade
-window will re-alert as new.
-
-A trade is alerted exactly once, when its key is first seen and the order it
-belongs to clears the notional threshold. Keys are recorded *before* the send
-attempt, so a Telegram failure drops that one alert rather than retrying it
-every poll.
-
----
-
-## Troubleshooting
-
-**No alerts at all.** Check `/status`. If no poll has completed, the job queue
-probably isn't installed — reinstall with the `[job-queue]` extra. If polls are
-running cleanly, your threshold may simply be above recent activity; drop
-`MIN_TRADE_NOTIONAL` temporarily to confirm the pipeline works end to end.
-
-**Alerts stopped after running fine for a while.** Look for the
-`WARNING: poll took Ns` line. Polls that overrun `POLL_INTERVAL` get coalesced,
-which thins out your effective polling rate. Raise the interval or lower
-`HTTP_CONCURRENCY` if you're being rate limited.
-
-**Duplicate alerts.** Almost always means state was lost — a deleted or
-corrupted `polymarket_state.json`, or the bot running from two different
-working directories. Both instances would keep separate state files.
-
-**Fetch errors piling up in `/status`.** Usually Polymarket rate limiting.
-Raise `POLL_INTERVAL` or lower `HTTP_CONCURRENCY`.
-
-**Telegram "chat not found".** The bot can't initiate conversations. Each user
-in `TELEGRAM_CHAT_IDS` must message the bot first.
-
----
-
-## Notes
-
-The 150-trade fetch window is the real constraint on how long the bot can be
-offline. If a tracked address makes more than 150 trades while the bot is down,
-the ones that scrolled out of the window are gone — they'll never be seen, and
-they won't alert.
-
-Timestamps from the API are treated as UTC seconds. The bot does not attempt to
-detect market resolution, position changes, or PnL; it reports fills only.
+- Ingest lag as a CloudWatch metric with an alarm, rather than a query nobody
+  runs
+- Market resolution outcomes joined in, so whale accuracy becomes measurable —
+  the actual interesting question this dataset could answer
+- Compaction job for raw once file count per partition gets large
