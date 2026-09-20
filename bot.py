@@ -1,6 +1,7 @@
 import asyncio  # CHANGED: needed for concurrent fetches + semaphore
 import json
 import os
+import sink
 import tempfile  # CHANGED: for atomic state writes
 from datetime import datetime, timezone
 from time import time
@@ -24,7 +25,10 @@ from telegram.error import TelegramError, TimedOut, NetworkError
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 # Users/chats that receive alerts
-TELEGRAM_CHAT_IDS = {882534235, 1390191964}
+# CHANGED: chat IDs out of source — the repo is public.
+TELEGRAM_CHAT_IDS = {
+    int(x) for x in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if x.strip()
+}
 
 # CHANGED: 20s was very tight for 19 sequential fetches. Fetches are now
 # concurrent (see poll_polymarket), so 20 is survivable, but 30 gives headroom
@@ -541,6 +545,9 @@ async def poll_polymarket(context: ContextTypes.DEFAULT_TYPE):
 
         label = TRACKED_ADDRESSES.get(address, address)
 
+        # CHANGED: persist every trade before thresholding or dedupe
+        sink.record_trades(address, label, trades)
+
         # Oldest -> newest
         trades_sorted = sorted(trades, key=lambda t: int(t.get("timestamp") or 0))
 
@@ -618,6 +625,8 @@ async def poll_polymarket(context: ContextTypes.DEFAULT_TYPE):
 
     save_state(STATE)
 
+    sink.maybe_flush()
+
     LAST_POLL.update(
         finished_at=int(time()),
         duration=time() - started,
@@ -649,6 +658,10 @@ def main():
             "TELEGRAM_BOT_TOKEN is not set.\n"
             "  export TELEGRAM_BOT_TOKEN='your-token-here'"
         )
+
+    if sink.enabled():
+        sink.drain_spill()
+        print(f"[sink] writing to s3://{sink.S3_RAW_BUCKET}/{sink.S3_RAW_PREFIX}")
 
     # Configure HTTPX-based request with higher timeouts for Telegram
     request = HTTPXRequest(
